@@ -8,6 +8,8 @@ dist/
 *.log
 wa-logs.txt
 mcp-logs.txt
+wa-logs.txt.*
+mcp-logs.txt.*
 
 # Baileys authentication data (IMPORTANT!)
 auth_info/
