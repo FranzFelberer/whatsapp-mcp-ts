@@ -5,7 +5,7 @@ import {
   makeCacheableSignalKeyStore,
   DisconnectReason,
   type WAMessage,
-  type proto,
+  proto,
   isJidGroup,
   jidNormalizedUser,
 } from "@whiskeysockets/baileys";
@@ -18,6 +18,8 @@ import {
   storeMessage,
   storeChat,
   storeContact,
+  linkLidToPn,
+  getUnmappedLids,
   type Message as DbMessage,
 } from "./database.ts";
 
@@ -33,24 +35,30 @@ function parseMessageForDb(msg: WAMessage): DbMessage | null {
   let content: string | null = null;
   const messageType = Object.keys(msg.message)[0];
 
+  let isMedia = false;
   if (msg.message.conversation) {
     content = msg.message.conversation;
   } else if (msg.message.extendedTextMessage?.text) {
     content = msg.message.extendedTextMessage.text;
-  } else if (msg.message.imageMessage?.caption) {
-    content = `[Image] ${msg.message.imageMessage.caption}`;
-  } else if (msg.message.videoMessage?.caption) {
-    content = `[Video] ${msg.message.videoMessage.caption}`;
-  } else if (msg.message.documentMessage?.caption) {
+  } else if (msg.message.imageMessage) {
+    content = `[Image] ${msg.message.imageMessage.caption ?? ""}`.trim();
+    isMedia = true;
+  } else if (msg.message.videoMessage) {
+    content = `[Video] ${msg.message.videoMessage.caption ?? ""}`.trim();
+    isMedia = true;
+  } else if (msg.message.documentMessage) {
     content = `[Document] ${
       msg.message.documentMessage.caption ||
       msg.message.documentMessage.fileName ||
       ""
-    }`;
+    }`.trim();
+    isMedia = true;
   } else if (msg.message.audioMessage) {
     content = `[Audio]`;
+    isMedia = true;
   } else if (msg.message.stickerMessage) {
     content = `[Sticker]`;
+    isMedia = true;
   } else if (msg.message.locationMessage?.address) {
     content = `[Location] ${msg.message.locationMessage.address}`;
   } else if (msg.message.contactMessage?.displayName) {
@@ -76,12 +84,40 @@ function parseMessageForDb(msg: WAMessage): DbMessage | null {
 
   const timestamp = new Date(timestampSeconds * 1000);
 
-  let senderJid: string | null | undefined = msg.key.participant;
+  // For group messages, newer WhatsApp protocol puts the sender on the top-level
+  // WebMessageInfo.participant rather than key.participant. Fall back accordingly.
+  let senderJid: string | null | undefined =
+    msg.key.participant || (msg as any).participant;
   if (!msg.key.fromMe && !senderJid && !isJidGroup(msg.key.remoteJid)) {
     senderJid = msg.key.remoteJid;
   }
   if (msg.key.fromMe && !isJidGroup(msg.key.remoteJid)) {
     senderJid = null;
+  }
+
+  // pushName is the sender's display name as broadcast by their phone — useful for
+  // group participants we have no contact entry for. Persist it as a contact hint.
+  const pushName = (msg as any).pushName as string | null | undefined;
+  if (senderJid && pushName) {
+    try {
+      // Lazy import to avoid circular ref at top of file
+      import("./database.ts").then(({ storeContact }) => {
+        storeContact({
+          jid: senderJid as string,
+          notify: pushName,
+        });
+      }).catch(() => {});
+    } catch {}
+  }
+
+  let rawEncoded: Uint8Array | null = null;
+  if (isMedia) {
+    try {
+      rawEncoded = proto.WebMessageInfo.encode(msg).finish();
+    } catch (err) {
+      // If encoding fails, we silently drop raw storage; content is still saved.
+      rawEncoded = null;
+    }
   }
 
   return {
@@ -91,6 +127,7 @@ function parseMessageForDb(msg: WAMessage): DbMessage | null {
     content: content,
     timestamp: timestamp,
     is_from_me: msg.key.fromMe ?? false,
+    raw_message: rawEncoded,
   };
 }
 
@@ -111,7 +148,6 @@ export async function startWhatsAppConnection(
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
     generateHighQualityLinkPreview: true,
-    shouldIgnoreJid: (jid) => isJidGroup(jid),
   });
 
   sock.ev.process(async (events) => {
@@ -147,7 +183,11 @@ export async function startWhatsAppConnection(
         }
       } else if (connection === "open") {
         logger.info(`Connection opened. WA user: ${sock.user?.name}`);
-        // console.log("Logged as", sock.user?.name);
+        // Kick off LID->PN backfill once the socket is live. We don't await it so
+        // the connection-update handler stays snappy.
+        backfillLidMappings(sock, logger).catch((err) => {
+          logger.warn({ err }, "LID backfill failed");
+        });
       }
     }
 
@@ -161,14 +201,22 @@ export async function startWhatsAppConnection(
         events["messaging-history.set"];
       if (contacts.length > 0) {
         logger.info(`Storing ${contacts.length} contacts from history sync.`);
-        contacts.forEach((c) =>
+        contacts.forEach((c) => {
           storeContact({
             jid: c.id,
             name: c.name ?? null,
             notify: c.notify ?? null,
             phoneNumber: (c as any).phoneNumber ?? null,
-          })
-        );
+            lid: (c as any).lid ?? null,
+          });
+          // If the contact came in keyed by PN but also carries a LID, persist the
+          // LID separately so future @lid lookups resolve back to the same row.
+          const lid = (c as any).lid as string | undefined;
+          const pn = (c as any).phoneNumber as string | undefined;
+          if (lid && pn && c.id !== lid) {
+            linkLidToPn(lid, pn);
+          }
+        });
         logger.info(`Stored ${contacts.length} contacts from history sync.`);
       }
 
@@ -243,6 +291,51 @@ export async function startWhatsAppConnection(
   });
 
   return sock;
+}
+
+
+/**
+ * Walks all @lid JIDs referenced by the DB that we haven't yet mapped to a phone
+ * number, asks Baileys' signalRepository.lidMapping for the PN counterpart, and
+ * persists the link so chat/contact lookups resolve them.
+ */
+export async function backfillLidMappings(
+  sock: WhatsAppSocket,
+  logger: P.Logger,
+): Promise<{ resolved: number; unresolved: number }> {
+  const lidMapping = (sock as any)?.signalRepository?.lidMapping;
+  if (!lidMapping || typeof lidMapping.getPNForLID !== "function") {
+    logger.warn("LID mapping API not available on socket; skipping backfill");
+    return { resolved: 0, unresolved: 0 };
+  }
+
+  const lids = getUnmappedLids();
+  if (lids.length === 0) {
+    logger.info("LID backfill: nothing to resolve");
+    return { resolved: 0, unresolved: 0 };
+  }
+  logger.info(`LID backfill: resolving ${lids.length} unmapped LID JIDs`);
+
+  let resolved = 0;
+  let unresolved = 0;
+  for (const lid of lids) {
+    try {
+      const pn = await lidMapping.getPNForLID(lid);
+      if (pn) {
+        const normalized = jidNormalizedUser(pn);
+        linkLidToPn(lid, normalized);
+        resolved++;
+      } else {
+        unresolved++;
+      }
+    } catch (err) {
+      unresolved++;
+    }
+  }
+  logger.info(
+    `LID backfill complete: ${resolved} resolved, ${unresolved} unresolved`,
+  );
+  return { resolved, unresolved };
 }
 
 export async function sendWhatsAppMessage(

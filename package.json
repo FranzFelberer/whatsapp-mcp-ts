@@ -8,8 +8,8 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.8.0",
-    "@whiskeysockets/baileys": "^6.7.16",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "open": "^10.1.0",
     "pino": "^9.6.0",
     "zod": "^3.24.2"

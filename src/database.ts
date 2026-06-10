@@ -22,6 +22,7 @@ export type Message = {
   timestamp: Date;
   is_from_me: boolean;
   chat_name?: string | null;
+  raw_message?: Uint8Array | null;
 };
 
 let dbInstance: DatabaseSync | null = null;
@@ -71,6 +72,26 @@ export function initializeDatabase(): DatabaseSync {
       );
     `);
 
+  // Migration: add raw_message column if missing (stores proto-encoded WAMessage for media).
+  try {
+    const cols = db.prepare(`PRAGMA table_info(messages)`).all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "raw_message")) {
+      db.exec(`ALTER TABLE messages ADD COLUMN raw_message BLOB`);
+    }
+  } catch (e) {
+    console.error("Failed to migrate messages.raw_message:", e);
+  }
+
+  // Migration: add `lid` column to contacts (LID format JID for the same contact).
+  try {
+    const cols = db.prepare(`PRAGMA table_info(contacts)`).all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "lid")) {
+      db.exec(`ALTER TABLE contacts ADD COLUMN lid TEXT`);
+    }
+  } catch (e) {
+    console.error("Failed to migrate contacts.lid:", e);
+  }
+
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages (timestamp);`,
   );
@@ -82,6 +103,9 @@ export function initializeDatabase(): DatabaseSync {
   );
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_chats_last_message_time ON chats (last_message_time);`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_contacts_lid ON contacts (lid);`,
   );
 
   return db;
@@ -118,8 +142,8 @@ export function storeMessage(message: Message): void {
     storeChat({ jid: message.chat_jid, last_message_time: message.timestamp });
 
     const stmt = db.prepare(`
-            INSERT OR REPLACE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)
-            VALUES (@id, @chat_jid, @sender, @content, @timestamp, @is_from_me)
+            INSERT OR REPLACE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, raw_message)
+            VALUES (@id, @chat_jid, @sender, @content, @timestamp, @is_from_me, @raw_message)
         `);
 
     stmt.run({
@@ -129,6 +153,7 @@ export function storeMessage(message: Message): void {
       content: message.content,
       timestamp: message.timestamp.toISOString(),
       is_from_me: message.is_from_me ? 1 : 0,
+      raw_message: message.raw_message ?? null,
     });
 
     const updateChatTimeStmt = db.prepare(`
@@ -229,7 +254,7 @@ export function getChats(
                     : ""
                 }
             FROM chats c
-            LEFT JOIN contacts ct ON c.jid = ct.jid
+            LEFT JOIN contacts ct ON ct.jid = c.jid OR ct.lid = c.jid
         `;
 
     const params: (string | number)[] = [];
@@ -278,7 +303,7 @@ export function getChat(
                     : ""
                 }
             FROM chats c
-            LEFT JOIN contacts ct ON c.jid = ct.jid
+            LEFT JOIN contacts ct ON ct.jid = c.jid OR ct.lid = c.jid
             WHERE c.jid = ? -- Positional parameter 1
         `;
 
@@ -367,10 +392,11 @@ export function searchDbForContacts(
       FROM contacts
       WHERE
         LOWER(COALESCE(name, notify, phone_number, jid)) LIKE LOWER(?)
+        OR LOWER(COALESCE(lid, '')) LIKE LOWER(?)
       LIMIT ?
     `);
 
-    const rows = stmt.all(pattern, limit) as {
+    const rows = stmt.all(pattern, pattern, limit) as {
       jid: string;
       display_name: string | null;
     }[];
@@ -399,7 +425,7 @@ export function searchMessages(
             SELECT m.*, COALESCE(c.name, ct.name, ct.notify, ct.phone_number) as chat_name
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            LEFT JOIN contacts ct ON c.jid = ct.jid
+            LEFT JOIN contacts ct ON ct.jid = c.jid OR ct.lid = c.jid
             WHERE LOWER(m.content) LIKE LOWER(?) -- Param 1: searchPattern
         `;
     const params: (string | number | null)[] = [searchPattern];
@@ -424,6 +450,25 @@ export function searchMessages(
   }
 }
 
+export function getRawMessageById(
+  messageId: string,
+): { raw: Uint8Array; chat_jid: string } | null {
+  const db = getDb();
+  try {
+    const stmt = db.prepare(
+      `SELECT raw_message, chat_jid FROM messages WHERE id = ? LIMIT 1`,
+    );
+    const row = stmt.get(messageId) as
+      | { raw_message: Uint8Array | null; chat_jid: string }
+      | undefined;
+    if (!row || !row.raw_message) return null;
+    return { raw: row.raw_message, chat_jid: row.chat_jid };
+  } catch (error) {
+    console.error("Error getting raw message:", error);
+    return null;
+  }
+}
+
 export function closeDatabase(): void {
   if (dbInstance) {
     try {
@@ -441,16 +486,18 @@ export function storeContact(contact: {
   name?: string | null;
   notify?: string | null;
   phoneNumber?: string | null;
+  lid?: string | null;
 }): void {
   const db = getDb();
   try {
     const stmt = db.prepare(`
-      INSERT INTO contacts (jid, name, notify, phone_number)
-      VALUES (@jid, @name, @notify, @phone_number)
+      INSERT INTO contacts (jid, name, notify, phone_number, lid)
+      VALUES (@jid, @name, @notify, @phone_number, @lid)
       ON CONFLICT(jid) DO UPDATE SET
         name = COALESCE(excluded.name, name),
         notify = COALESCE(excluded.notify, notify),
-        phone_number = COALESCE(excluded.phone_number, phone_number)
+        phone_number = COALESCE(excluded.phone_number, phone_number),
+        lid = COALESCE(excluded.lid, lid)
     `);
 
     stmt.run({
@@ -458,8 +505,72 @@ export function storeContact(contact: {
       name: contact.name ?? null,
       notify: contact.notify ?? null,
       phone_number: contact.phoneNumber ?? null,
+      lid: contact.lid ?? null,
     });
   } catch (error) {
     console.error("Error storing contact:", error);
   }
 }
+
+/**
+ * Record a LID → PN mapping by attaching the LID to an existing PN-keyed contact,
+ * or creating a placeholder PN-keyed row if needed. Used by the LID backfill on
+ * startup so chat/message queries can resolve @lid JIDs to known contacts.
+ */
+export function linkLidToPn(lid: string, pnJid: string): void {
+  const db = getDb();
+  try {
+    db.prepare(`
+      INSERT INTO contacts (jid, lid, phone_number)
+      VALUES (@jid, @lid, @jid)
+      ON CONFLICT(jid) DO UPDATE SET
+        lid = COALESCE(excluded.lid, lid),
+        phone_number = COALESCE(phone_number, excluded.phone_number)
+    `).run({ jid: pnJid, lid });
+  } catch (error) {
+    console.error("Error linking LID->PN:", error);
+  }
+}
+
+/**
+ * Returns all distinct LID JIDs referenced by the DB (in chats.jid or messages.sender)
+ * that don't yet have a PN counterpart attached in contacts.
+ */
+export function getUnmappedLids(): string[] {
+  const db = getDb();
+  try {
+    const rows = db.prepare(`
+      SELECT DISTINCT lid_jid FROM (
+        SELECT jid AS lid_jid FROM chats WHERE jid LIKE '%@lid'
+        UNION
+        SELECT sender AS lid_jid FROM messages WHERE sender LIKE '%@lid'
+      )
+      WHERE lid_jid NOT IN (SELECT lid FROM contacts WHERE lid IS NOT NULL)
+    `).all() as { lid_jid: string }[];
+    return rows.map(r => r.lid_jid);
+  } catch (error) {
+    console.error("Error getting unmapped LIDs:", error);
+    return [];
+  }
+}
+
+/**
+ * Returns a human-friendly display string for a sender JID. Tries contacts
+ * table by jid, then by lid, then falls back to the local part of the JID.
+ */
+export function resolveSenderDisplay(senderJid: string): string {
+  const db = getDb();
+  try {
+    const row = db.prepare(`
+      SELECT COALESCE(name, notify, phone_number) AS display
+      FROM contacts
+      WHERE jid = ? OR lid = ?
+      LIMIT 1
+    `).get(senderJid, senderJid) as { display: string | null } | undefined;
+    if (row?.display) return row.display;
+  } catch (error) {
+    console.error("resolveSenderDisplay error:", error);
+  }
+  return senderJid.split("@")[0] ?? senderJid;
+}
+

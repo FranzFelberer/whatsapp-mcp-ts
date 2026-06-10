@@ -1,7 +1,18 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createServer as createHttpServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { jidNormalizedUser } from "@whiskeysockets/baileys";
+import {
+  jidNormalizedUser,
+  downloadMediaMessage,
+  proto,
+  type WAMessage,
+} from "@whiskeysockets/baileys";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 
 import {
   type Message as DbMessage,
@@ -12,6 +23,8 @@ import {
   getMessagesAround,
   searchDbForContacts,
   searchMessages,
+  getRawMessageById,
+  resolveSenderDisplay,
 } from "./database.ts";
 
 import { sendWhatsAppMessage, type WhatsAppSocket } from "./whatsapp.ts";
@@ -24,7 +37,7 @@ function formatDbMessageForJson(msg: DbMessage) {
     chat_name: msg.chat_name ?? "Unknown Chat",
     sender_jid: msg.sender ?? null,
     sender_display: msg.sender
-      ? msg.sender.split("@")[0]
+      ? resolveSenderDisplay(msg.sender)
       : msg.is_from_me
         ? "Me"
         : "Unknown",
@@ -43,7 +56,7 @@ function formatDbChatForJson(chat: DbChat) {
     last_message_preview: chat.last_message ?? null,
     last_sender_jid: chat.last_sender ?? null,
     last_sender_display: chat.last_sender
-      ? chat.last_sender.split("@")[0]
+      ? resolveSenderDisplay(chat.last_sender)
       : chat.last_is_from_me
         ? "Me"
         : null,
@@ -51,13 +64,11 @@ function formatDbChatForJson(chat: DbChat) {
   };
 }
 
-export async function startMcpServer(
+function createConfiguredServer(
   sock: WhatsAppSocket | null,
   mcpLogger: P.Logger,
   waLogger: P.Logger,
-): Promise<void> {
-  mcpLogger.info("Initializing MCP server...");
-
+): McpServer {
   const server = new McpServer({
     name: "whatsapp-baileys-ts",
     version: "0.1.0",
@@ -554,6 +565,143 @@ export async function startMcpServer(
     },
   );
 
+  server.tool(
+    "download_media",
+    {
+      message_id: z
+        .string()
+        .describe("The ID of the media message to download"),
+      output_dir: z
+        .string()
+        .optional()
+        .describe(
+          "Directory to save the file (default: ~/Downloads/whatsapp-media)",
+        ),
+    },
+    async ({ message_id, output_dir }) => {
+      mcpLogger.info(
+        `[MCP Tool] Executing download_media for msg ${message_id}`,
+      );
+      try {
+        const raw = getRawMessageById(message_id);
+        if (!raw) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `No raw message stored for ID ${message_id}. Either the message is not media, or it was received before media support was added.`,
+              },
+            ],
+          };
+        }
+
+        const decoded = proto.WebMessageInfo.decode(raw.raw) as WAMessage;
+        const m = decoded.message;
+        if (!m) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `Message ${message_id} has no decodable media content.`,
+              },
+            ],
+          };
+        }
+
+        // Determine a reasonable filename + extension
+        let ext = "bin";
+        let mime: string | undefined;
+        let suggestedName: string | undefined;
+        if (m.audioMessage) {
+          mime = m.audioMessage.mimetype ?? undefined;
+          ext = (mime && mime.includes("ogg")) ? "opus" : (mime?.split("/")[1]?.split(";")[0] ?? "ogg");
+        } else if (m.imageMessage) {
+          mime = m.imageMessage.mimetype ?? undefined;
+          ext = mime?.split("/")[1]?.split(";")[0] ?? "jpg";
+        } else if (m.videoMessage) {
+          mime = m.videoMessage.mimetype ?? undefined;
+          ext = mime?.split("/")[1]?.split(";")[0] ?? "mp4";
+        } else if (m.documentMessage) {
+          mime = m.documentMessage.mimetype ?? undefined;
+          suggestedName = m.documentMessage.fileName ?? undefined;
+          ext = mime?.split("/")[1]?.split(";")[0] ?? "bin";
+        } else if (m.stickerMessage) {
+          mime = m.stickerMessage.mimetype ?? undefined;
+          ext = "webp";
+        } else {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `Message ${message_id} does not contain downloadable media.`,
+              },
+            ],
+          };
+        }
+
+        // Resolve output directory (expand ~)
+        const defaultDir = path.join(os.homedir(), "Downloads", "whatsapp-media");
+        let dir = output_dir ?? defaultDir;
+        if (dir.startsWith("~/") || dir === "~") {
+          dir = path.join(os.homedir(), dir.slice(2));
+        }
+        fs.mkdirSync(dir, { recursive: true });
+
+        const buffer = (await downloadMediaMessage(
+          decoded,
+          "buffer",
+          {},
+          {
+            logger: waLogger,
+            reuploadRequest: sock?.updateMediaMessage ?? (async () => {
+              throw new Error("Socket unavailable for media reupload");
+            }),
+          },
+        )) as Buffer;
+
+        const baseName =
+          suggestedName ?? `whatsapp-${message_id}.${ext}`;
+        const outPath = path.join(dir, baseName);
+        fs.writeFileSync(outPath, buffer);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  path: outPath,
+                  size_bytes: buffer.length,
+                  mimetype: mime ?? null,
+                  message_id,
+                  chat_jid: raw.chat_jid,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error: any) {
+        mcpLogger.error(
+          `[MCP Tool Error] download_media failed for ${message_id}: ${error.message}`,
+        );
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Error downloading media for ${message_id}: ${error.message}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
   server.resource("db_schema", "schema://whatsapp/main", async (uri) => {
     mcpLogger.info(`[MCP Resource] Request for ${uri.href}`);
     const schemaText = `
@@ -570,20 +718,92 @@ TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIM
     };
   });
 
-  const transport = new StdioServerTransport();
-  mcpLogger.info("MCP server configured. Connecting stdio transport...");
+  return server;
+}
 
-  try {
-    await server.connect(transport);
-    mcpLogger.info(
-      "MCP transport connected. Server is ready and listening via stdio.",
-    );
-  } catch (error: any) {
-    mcpLogger.error(
-      `[FATAL] Failed to connect MCP transport: ${error.message}`,
-      error,
-    );
-    process.exit(1);
+export async function startMcpServer(
+  sock: WhatsAppSocket | null,
+  mcpLogger: P.Logger,
+  waLogger: P.Logger,
+): Promise<void> {
+  mcpLogger.info("Initializing MCP server...");
+  const mode = (process.env.MCP_TRANSPORT || "stdio").toLowerCase();
+
+  if (mode === "http") {
+    const port = parseInt(process.env.MCP_PORT || "8011", 10);
+    const host = process.env.MCP_HOST || "127.0.0.1";
+    mcpLogger.info(`MCP server configured. Starting HTTP transport on ${host}:${port}...`);
+
+    // One McpServer + transport per session (SDK requires 1:1 binding)
+    const sessions: Record<string, { server: McpServer; transport: StreamableHTTPServerTransport }> = {};
+
+    const httpServer = createHttpServer(async (req, res) => {
+      try {
+        if (!req.url?.startsWith("/mcp")) {
+          res.statusCode = 404;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ error: "Not Found" }));
+          return;
+        }
+
+        const sessionId = req.headers["mcp-session-id"] as string | undefined;
+        const existing = sessionId ? sessions[sessionId] : undefined;
+
+        if (existing) {
+          await existing.transport.handleRequest(req, res);
+          return;
+        }
+
+        // New session — spin up a fresh server and transport
+        const perSessionServer = createConfiguredServer(sock, mcpLogger, waLogger);
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid) => {
+            sessions[sid] = { server: perSessionServer, transport };
+            mcpLogger.info(`[MCP HTTP] Session initialized: ${sid}`);
+          },
+        });
+        transport.onclose = () => {
+          if (transport.sessionId && sessions[transport.sessionId]) {
+            delete sessions[transport.sessionId];
+            mcpLogger.info(`[MCP HTTP] Session closed: ${transport.sessionId}`);
+          }
+        };
+        await perSessionServer.connect(transport);
+        await transport.handleRequest(req, res);
+      } catch (err: any) {
+        mcpLogger.error(`[MCP HTTP] Request error: ${err.message}`);
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ error: err.message }));
+        }
+      }
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      httpServer.once("error", reject);
+      httpServer.listen(port, host, () => resolve());
+    });
+
+    mcpLogger.info(`MCP HTTP transport listening on http://${host}:${port}/mcp`);
+  } else {
+    const server = createConfiguredServer(sock, mcpLogger, waLogger);
+    const transport = new StdioServerTransport();
+    mcpLogger.info("MCP server configured. Connecting stdio transport...");
+
+    try {
+      await server.connect(transport);
+      mcpLogger.info(
+        "MCP transport connected. Server is ready and listening via stdio.",
+      );
+    } catch (error: any) {
+      mcpLogger.error(
+        `[FATAL] Failed to connect MCP transport: ${error.message}`,
+        error,
+      );
+      process.exit(1);
+    }
   }
 
   mcpLogger.info(
