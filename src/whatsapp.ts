@@ -140,17 +140,64 @@ export async function startWhatsAppConnection(
   const { version, isLatest } = await fetchLatestBaileysVersion();
   logger.info(`Using WA v${version.join(".")}, isLatest: ${isLatest}`);
 
-  const sock = makeWASocket({
-    version,
-    logger,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
-    generateHighQualityLinkPreview: true,
-  });
+  // One logical connection that transparently re-establishes itself.
+  //
+  // `currentSock` always points at the live socket; the Proxy returned at the end
+  // forwards to it, so callers (the MCP server / tools) never end up holding a
+  // stale, disconnected socket after a reconnect.
+  //
+  // Reconnects are guarded with a single-flight lock, exponential backoff, and an
+  // explicit teardown of the dying socket. This was the memory-leak root cause:
+  // previously every "close" recursively built a brand-new socket without ending
+  // the old one or detaching its event handler, so a WhatsApp-side disconnect
+  // storm (we've logged thousands of `timedOut` closes per minute) accumulated
+  // orphaned sockets — each with its own WebSocket, keep-alive timer and
+  // signal-key cache — until the process ballooned to multiple GB.
+  let currentSock: WhatsAppSocket = null as any;
+  let detach: (() => void) | null = null;
+  let reconnecting = false;
+  let attempts = 0;
+  const BASE_DELAY_MS = 1_000;
+  const MAX_DELAY_MS = 30_000;
 
-  sock.ev.process(async (events) => {
+  const teardown = (dead: WhatsAppSocket) => {
+    // Detach our handler and end the socket so its WebSocket, keep-alive timer,
+    // Noise state and signal-key cache become garbage-collectable.
+    try {
+      detach?.();
+    } catch {}
+    detach = null;
+    try {
+      dead.end(undefined);
+    } catch {}
+  };
+
+  const scheduleReconnect = (dead: WhatsAppSocket) => {
+    if (reconnecting) return; // single-flight: ignore duplicate close events
+    reconnecting = true;
+    teardown(dead);
+    const delay = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** attempts);
+    attempts++;
+    logger.info(`Reconnecting in ${delay}ms (attempt ${attempts})`);
+    setTimeout(() => {
+      reconnecting = false;
+      connect();
+    }, delay);
+  };
+
+  const connect = () => {
+    const sock = makeWASocket({
+      version,
+      logger,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      generateHighQualityLinkPreview: true,
+    });
+    currentSock = sock;
+
+    detach = sock.ev.process(async (events) => {
     if (events["connection.update"]) {
       const update = events["connection.update"];
       const { connection, lastDisconnect, qr } = update;
@@ -173,8 +220,7 @@ export async function startWhatsAppConnection(
           lastDisconnect?.error
         );
         if (statusCode !== DisconnectReason.loggedOut) {
-          logger.info("Reconnecting...");
-          startWhatsAppConnection(logger);
+          scheduleReconnect(sock);
         } else {
           logger.error(
             "Connection closed: Logged Out. Please delete auth_info and restart."
@@ -182,6 +228,7 @@ export async function startWhatsAppConnection(
           process.exit(1);
         }
       } else if (connection === "open") {
+        attempts = 0; // reset backoff once we're actually connected
         logger.info(`Connection opened. WA user: ${sock.user?.name}`);
         // Kick off LID->PN backfill once the socket is live. We don't await it so
         // the connection-update handler stays snappy.
@@ -288,9 +335,26 @@ export async function startWhatsAppConnection(
         });
       }
     }
+    });
+  };
+
+  connect();
+
+  // Stable handle: always delegates to the live socket, so a reconnect swaps the
+  // underlying socket transparently without invalidating references the MCP
+  // server captured at startup.
+  const handle = new Proxy({} as WhatsAppSocket, {
+    get(_target, prop) {
+      const value = (currentSock as any)[prop];
+      return typeof value === "function" ? value.bind(currentSock) : value;
+    },
+    set(_target, prop, value) {
+      (currentSock as any)[prop] = value;
+      return true;
+    },
   });
 
-  return sock;
+  return handle;
 }
 
 
